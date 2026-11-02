@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data mentah hasil unduhan (aset besar tidak ikut ter-versi)
+Dataset/*.pdf
+Dataset/*.zip
+data/raw/
+data/*.pdf
+
+# Logs & OS junk
+*.log
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+
+.commandcode/
