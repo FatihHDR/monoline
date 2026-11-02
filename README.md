@@ -69,7 +69,26 @@ pip install -r requirements.txt
 
 ### 1. Akuisisi data (Crawler)
 
-Mengunduh berkas PDF putusan berdasarkan kata kunci Pengadilan Negeri:
+Untuk mengunduh PDF putusan asli melalui Playwright dan menyimpannya langsung
+ke `Dataset/`, jalankan:
+
+```bash
+python "tugas 2/download_50_pdfs.py"
+```
+
+Pengunduh hanya menghitung berkas dengan signature PDF serta teks awal putusan
+pengadilan yang sesuai. Respons HTML dan halaman detail yang dicetak ke PDF
+akan dilewati; hasil kurang dari 50 berarti lampiran PDF asli yang dapat diakses
+belum mencukupi, bukan diganti dengan cetakan halaman. Untuk setiap putusan
+yang menyediakan tautan **Download PDF**, Playwright mengeklik tautan tersebut
+dan menyimpan unduhan otomatis ke `Dataset/` tanpa dialog pemilihan lokasi.
+Jendela browser menampilkan daftar/putusan yang sedang diperiksa; jika sumber
+mengembalikan halaman verifikasi, selesaikan verifikasi tersebut di browser
+dalam batas waktu yang tersedia. Proses tidak menyelesaikan CAPTCHA secara
+otomatis. Jika akses tetap dibatasi (`403` atau `429`), proses berhenti dan
+dapat dilanjutkan setelah akses tersedia.
+
+Alternatif crawler berbasis `requests` untuk pencarian berdasarkan kata kunci:
 
 ```bash
 python src/crawler.py --pn "Negeri Jakarta Barat" --out Dataset --max 50

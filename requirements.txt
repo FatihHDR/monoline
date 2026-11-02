@@ -6,3 +6,4 @@ openpyxl==3.1.2
 Sastrawi==1.0.1
 scikit-learn==1.4.1.post1
 nltk==3.8.1
+playwright==1.64.1
