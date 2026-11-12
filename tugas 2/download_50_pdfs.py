@@ -1,37 +1,95 @@
-import os
-import re
-import time
+"""Download putusan PDF (PN Jakarta Selatan, Narkotika, 2023-2025).
+
+Pendekatan yang dipakai:
+- Browser Chrome asli (persistent profile) supaya cookie/clearance situs
+  (Cloudflare + ALTCHA) tetap valid.
+- Semua pengambilan data memakai ``fetch()`` dari dalam halaman (same-origin,
+  credentials include). Dengan cara ini kita tidak pernah membuka endpoint
+  unduhan secara langsung sehingga tidak memicu halaman verifikasi bot.
+- PDF diambil sebagai byte, divalidasi signature ``%PDF-`` + isi putusan,
+  lalu disimpan ke ``Dataset/``.
+
+Script bersifat resumable: jalankan ulang kapan saja, berkas yang sudah ada
+dan valid akan dipertahankan.
+"""
+
+import base64
 import json
+import os
+import random
+import re
+import sys
+import time
 from urllib.parse import urljoin
 
 import pdfplumber
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import sync_playwright
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = "https://putusan3.mahkamahagung.go.id"
 DATASET_DIR = os.path.join(BASE_DIR, "Dataset")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 METADATA_FILE = os.path.join(DATA_DIR, "metadata_raw.json")
-USER_DATA_DIR = os.path.join(BASE_DIR, "playwright_user_data")
+PROFILE_DIR = os.path.join(BASE_DIR, "playwright_user_data")
 
 os.makedirs(DATASET_DIR, exist_ok=True)
 os.makedirs(DATA_DIR, exist_ok=True)
 
-TARGET_NEW = 50
+TARGET_TOTAL = 100
+YEARS = [2023, 2024, 2025]
+MAX_PAGES = 30
+MIN_DELAY = 0.8
+MAX_DELAY = 1.8
+
+FETCH_TEXT_JS = """async (url) => {
+    try {
+        const r = await fetch(url, {credentials: "include"});
+        return {status: r.status, url: r.url, text: await r.text()};
+    } catch (e) {
+        return {status: -1, url: url, text: "", error: String(e)};
+    }
+}"""
+
+FETCH_PDF_JS = """async (url) => {
+    try {
+        const r = await fetch(url, {credentials: "include"});
+        const buf = await r.arrayBuffer();
+        const bytes = new Uint8Array(buf);
+        let bin = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return {
+            ok: r.ok,
+            status: r.status,
+            type: r.headers.get("content-type") || "",
+            len: bytes.length,
+            prefix: Array.from(bytes.slice(0, 5)),
+            b64: btoa(bin)
+        };
+    } catch (e) {
+        return {ok: false, status: -1, error: String(e), len: 0};
+    }
+}"""
+
+
+def sleep_polite(low=MIN_DELAY, high=MAX_DELAY):
+    time.sleep(random.uniform(low, high))
 
 
 def clean_filename(text: str) -> str:
-    cleaned = re.sub(r'[\\/*?:"<>|]', '_', text)
-    cleaned = re.sub(r'\s+', '_', cleaned.strip())
+    cleaned = re.sub(r'[\\/*?:"<>|]', "_", text)
+    cleaned = re.sub(r"\s+", "_", cleaned.strip())
     return cleaned
 
 
 def is_court_pdf(path: str, case_number: str = "") -> bool:
+    """True bila berkas adalah PDF putusan pengadilan yang bisa diekstrak."""
     try:
-        if not os.path.isfile(path):
+        if not os.path.isfile(path) or os.path.getsize(path) < 2000:
             return False
         with open(path, "rb") as handle:
             if handle.read(5) != b"%PDF-":
@@ -48,36 +106,9 @@ def is_court_pdf(path: str, case_number: str = "") -> bool:
             if normalize(case_number) not in normalize(text):
                 return False
         return True
-    except Exception as error:
-        print(f"[WARN] Could not verify PDF {path}: {error}")
+    except Exception as error:  # noqa: BLE001
+        print(f"[WARN] Gagal memverifikasi PDF {os.path.basename(path)}: {error}")
         return False
-
-
-def wait_for_manual_verification(page, selector: str) -> bool:
-    title = page.title().lower()
-    try:
-        body = page.locator("body").inner_text(timeout=5000).lower()
-    except PlaywrightTimeoutError:
-        body = ""
-    challenge_terms = ("just a moment", "verify you are human", "captcha", "turnstile")
-    if not any(term in title or term in body for term in challenge_terms):
-        return False
-
-    print(
-        "[ACTION] Cloudflare meminta verifikasi manusia. Klik checkbox "
-        "'Verify you are human' di jendela Chrome dan jangan tutup jendela. "
-        "Unduhan akan dilanjutkan otomatis setelah halaman putusan terbuka "
-        "(maksimal 10 menit)."
-    )
-    try:
-        page.wait_for_selector(selector, state="attached", timeout=600000)
-    except PlaywrightTimeoutError:
-        print("[BLOCKED] Verifikasi situs belum selesai.")
-        return False
-    except PlaywrightError as error:
-        print(f"[BLOCKED] Browser ditutup saat verifikasi: {error}")
-        return False
-    return True
 
 
 def extract_metadata(soup: BeautifulSoup) -> dict:
@@ -90,9 +121,9 @@ def extract_metadata(soup: BeautifulSoup) -> dict:
         "catatan_amar": "",
         "status_bht": False,
         "barang_bukti": "",
-        "amar_putusan": ""
+        "amar_putusan": "",
     }
-    
+
     full_text = soup.get_text()
     if "berkekuatan hukum tetap" in full_text.lower():
         meta["status_bht"] = True
@@ -105,7 +136,8 @@ def extract_metadata(soup: BeautifulSoup) -> dict:
             if "nomor" in key and not meta["nomor"]:
                 meta["nomor"] = val
             elif "lembaga peradilan" in key:
-                meta["lembaga"] = val
+                if val:
+                    meta["lembaga"] = val
             elif "tahun" in key and not meta["tahun"]:
                 meta["tahun"] = val
             elif "amar lainnya" in key:
@@ -115,262 +147,301 @@ def extract_metadata(soup: BeautifulSoup) -> dict:
             elif "amar" in key and not meta["amar"]:
                 meta["amar"] = val
 
+    catatan = meta["catatan_amar"] or full_text
+    bb_match = re.search(
+        r"(?:barang\s*bukti|menetapkan\s*barang\s*bukti(?:\s*berupa)?)\s*[:\-]?\s*"
+        r"(.*?)(?:membebankan|memperhatikan|demikianlah|putusan\s*ini|\Z)",
+        catatan,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if bb_match:
+        meta["barang_bukti"] = bb_match.group(1).strip()
+
+    amar_match = re.search(
+        r"(?:M\s*E\s*N\s*G\s*A\s*D\s*I\s*L\s*I|Menyatakan\s*Terdakwa)"
+        r"(.*?)(?:Menetapkan\s*barang\s*bukti|barang\s*bukti|\Z)",
+        catatan,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if amar_match:
+        prefix = "MENGADILI: " if "M E N G A D I L I" in catatan else ""
+        meta["amar_putusan"] = (prefix + amar_match.group(1)).strip()
+    else:
+        meta["amar_putusan"] = meta["catatan_amar"] or meta["amar_lainnya"] or meta["amar"]
+
     return meta
 
-def main():
-    print(f"==================================================")
-    print(f"[START] Collecting {TARGET_NEW} new court decision PDFs")
-    print(f"Target Directory: {DATASET_DIR}")
-    print(f"==================================================")
 
-    # Count existing valid PDFs
-    existing = [
-        f for f in os.listdir(DATASET_DIR)
-        if f.lower().endswith(".pdf") and is_court_pdf(os.path.join(DATASET_DIR, f))
-    ]
-    existing_files = set(existing)
-    print(f"[INFO] Existing valid PDFs preserved: {len(existing_files)}")
-    print(f"[INFO] Target: {TARGET_NEW} new verified PDFs")
+def find_pdf_url(soup: BeautifulSoup) -> str | None:
+    col3 = soup.find("div", id="collapseThree")
+    scope = col3 if col3 else soup
+    anchor = scope.find("a", href=re.compile(r"/download_file/.*/pdf/"))
+    if not anchor:
+        return None
+    return urljoin(BASE_URL, anchor["href"])
 
-    metadata_list = []
-    if os.path.exists(METADATA_FILE):
-        try:
-            with open(METADATA_FILE, "r", encoding="utf-8") as f:
-                metadata_list = json.load(f)
-        except Exception:
-            metadata_list = []
 
-    seen_urls = set()
-    for item in metadata_list:
-        filename = item.get("pdf_filename")
-        url = item.get("url")
-        if not filename or not url:
+def list_url(year: int, page_num: int) -> str:
+    base = (
+        f"{BASE_URL}/direktori/index/pengadilan/pn-jakarta-selatan/kategori/"
+        f"narkotika-dan-psikotropika-1/tahunjenis/putus/tahun/{year}"
+    )
+    if page_num == 1:
+        return f"{base}.html"
+    return f"{base}/page/{page_num}.html"
+
+
+def decision_links_from_html(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+    for anchor in soup.find_all("a", href=re.compile(r"/direktori/putusan/")):
+        href = urljoin(BASE_URL, anchor["href"])
+        if href in links:
             continue
-        existing_path = os.path.join(DATASET_DIR, filename)
-        if is_court_pdf(existing_path, item.get("nomor", "")):
-            seen_urls.add(url)
+        if any(token in href for token in ("kategori", "pengadilan", "tahun")):
+            continue
+        links.append(href)
+    return links
+
+
+def fetch_text(page, url: str, label: str = "", retries: int = 4):
+    for attempt in range(1, retries + 1):
+        result = page.evaluate(FETCH_TEXT_JS, url)
+        status = result.get("status")
+        if status == 200 and result.get("text"):
+            return result
+        if status in (403, 429):
+            wait = 15 * attempt
+            print(f"[BLOCKED] {label} status {status}; tunggu {wait}s lalu coba lagi "
+                  f"({attempt}/{retries}) ...", flush=True)
+            time.sleep(wait)
+        else:
+            print(f"[WARN] {label} status {status}; ulang ({attempt}/{retries})", flush=True)
+            time.sleep(2 * attempt)
+    return None
+
+
+def fetch_pdf_bytes(page, url: str, retries: int = 4):
+    for attempt in range(1, retries + 1):
+        result = page.evaluate(FETCH_PDF_JS, url)
+        if (
+            result.get("ok")
+            and result.get("len", 0) > 2000
+            and result.get("prefix") == [37, 80, 68, 70, 45]  # %PDF-
+            and result.get("b64")
+        ):
+            return base64.b64decode(result["b64"])
+        if result.get("status") in (403, 429):
+            wait = 15 * attempt
+            print(f"[BLOCKED] PDF status {result.get('status')}; tunggu {wait}s "
+                  f"({attempt}/{retries}) ...", flush=True)
+            time.sleep(wait)
+        else:
+            print(f"[WARN] PDF bukan byte valid (status={result.get('status')}, "
+                  f"len={result.get('len')}); ulang ({attempt}/{retries})", flush=True)
+            time.sleep(2 * attempt)
+    return None
+
+
+def load_metadata() -> list[dict]:
+    if not os.path.exists(METADATA_FILE):
+        return []
+    try:
+        with open(METADATA_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_metadata(records: list[dict]) -> None:
+    with open(METADATA_FILE, "w", encoding="utf-8") as handle:
+        json.dump(records, handle, ensure_ascii=False, indent=2)
+
+
+def main() -> None:
+    print("=" * 62)
+    print(f"[START] Mengumpulkan {TARGET_TOTAL} PDF putusan narkotika")
+    print("        PN Jakarta Selatan | Tahun 2023-2025 | Non-BHT")
+    print(f"        Tujuan: {DATASET_DIR}")
+    print("=" * 62)
+
+    metadata = load_metadata()
+    metadata_by_file = {
+        item.get("pdf_filename"): item
+        for item in metadata
+        if item.get("pdf_filename")
+    }
+
+    existing_files: set[str] = set()
+    existing_numbers: set[str] = set()
+    for name in os.listdir(DATASET_DIR):
+        if not name.lower().endswith(".pdf"):
+            continue
+        path = os.path.join(DATASET_DIR, name)
+        if not is_court_pdf(path):
+            continue
+        existing_files.add(name)
+        item = metadata_by_file.get(name)
+        if item and item.get("nomor"):
+            existing_numbers.add(item["nomor"])
+
+    total_saved = len(existing_files)
+    print(f"[INFO] PDF valid yang sudah ada: {total_saved}/{TARGET_TOTAL}")
+
+    if total_saved >= TARGET_TOTAL:
+        print("[DONE] Target sudah terpenuhi.")
+        return
+
+    seen_urls = {
+        item.get("url") for item in metadata if item.get("pdf_filename") in existing_files
+    }
 
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
-            user_data_dir=USER_DATA_DIR,
+            user_data_dir=PROFILE_DIR,
             headless=False,
             channel="chrome",
+            args=["--disable-blink-features=AutomationControlled"],
             accept_downloads=True,
         )
         page = context.pages[0] if context.pages else context.new_page()
 
-        print("[INFO] Browser siap; membuka daftar putusan yang sudah difilter.")
+        # Buka halaman utama dulu agar cookie/clearance situs aktif.
+        try:
+            page.goto(f"{BASE_URL}/direktori.html", wait_until="domcontentloaded", timeout=60000)
+        except PlaywrightError as error:
+            print(f"[WARN] Gagal membuka halaman utama: {error}")
+        time.sleep(2)
+        print("[INFO] Browser siap.")
 
-        # Build list of page URLs to crawl
-        # 1) Years 2023, 2024, 2025
-        page_urls = []
-        for yr in [2023, 2024, 2025]:
-            for p_num in range(1, 15):
-                if p_num == 1:
-                    u = f"https://putusan3.mahkamahagung.go.id/direktori/index/pengadilan/pn-jakarta-selatan/kategori/narkotika-dan-psikotropika-1/tahunjenis/putus/tahun/{yr}.html"
-                else:
-                    u = f"https://putusan3.mahkamahagung.go.id/direktori/index/pengadilan/pn-jakarta-selatan/kategori/narkotika-dan-psikotropika-1/tahunjenis/putus/tahun/{yr}/page/{p_num}.html"
-                page_urls.append((yr, p_num, u))
-
-        access_blocked = False
-        new_downloaded = 0
-        for label, p_num, list_url in page_urls:
-            if new_downloaded >= TARGET_NEW:
-                break
-
-            print(f"\n[INFO] Loading list [{label} P{p_num}]: {list_url}")
-            try:
-                list_response = page.goto(
-                    list_url,
-                    wait_until="domcontentloaded",
-                    timeout=45000,
-                )
-            except Exception as e:
-                if context.is_closed():
-                    raise RuntimeError("Browser ditutup sebelum proses unduh selesai.") from e
-                print(f"[WARN] Error fetching list {list_url}: {e}")
-                continue
-
-            status = list_response.status if list_response else None
-            if status in (403, 429):
-                if not wait_for_manual_verification(
-                    page,
-                    'a[href*="/direktori/putusan/"]',
-                ):
-                    print(f"[BLOCKED] Server returned {status} for {list_url}; stopping politely.")
-                    access_blocked = True
+        try:
+            stop_all = False
+            for year in YEARS:
+                if stop_all or total_saved >= TARGET_TOTAL:
                     break
-            if status != 200:
-                if status not in (403, 429):
-                    status = status if status is not None else "no response"
-                    print(f"[WARN] List returned {status}, skipping page.")
-                    continue
+                print(f"\n[INFO] ============== Tahun {year} ==============")
 
-            time.sleep(1.5)
-            soup = BeautifulSoup(page.content(), 'html.parser')
-            decision_links = []
-            for a in soup.find_all('a', href=re.compile(r'/direktori/putusan/')):
-                h = urljoin(BASE_URL, a['href'])
-                if h not in decision_links and not any(k in h for k in ['kategori', 'pengadilan', 'tahun']):
-                    decision_links.append(h)
+                for page_num in range(1, MAX_PAGES + 1):
+                    if stop_all or total_saved >= TARGET_TOTAL:
+                        break
 
-            if not decision_links:
-                print(f"[INFO] No decisions found on this page.")
-                break
+                    url = list_url(year, page_num)
+                    listing = fetch_text(page, url, label=f"list {year} p{page_num}")
+                    if listing is None:
+                        print(f"[STOP] Daftar {year} halaman {page_num} tidak dapat diakses.")
+                        stop_all = True
+                        break
 
-            print(f"[INFO] Found {len(decision_links)} decisions. Scanning for PDFs...")
+                    links = decision_links_from_html(listing["text"])
+                    print(f"[INFO] {year} p{page_num}: {len(links)} putusan ditemukan.")
+                    if not links:
+                        break
 
-            for decision_index, d_url in enumerate(decision_links, start=1):
-                if new_downloaded >= TARGET_NEW:
-                    break
+                    for index, detail_url in enumerate(links, start=1):
+                        if total_saved >= TARGET_TOTAL:
+                            break
+                        if detail_url in seen_urls:
+                            continue
+                        seen_urls.add(detail_url)
 
-                if d_url in seen_urls:
-                    continue
-
-                seen_urls.add(d_url)
-
-                try:
-                    print(
-                        f"[INFO] Opening decision {decision_index}/{len(decision_links)} "
-                        f"({new_downloaded}/{TARGET_NEW} new PDFs): {d_url}",
-                        flush=True,
-                    )
-                    detail_response = page.goto(
-                        d_url,
-                        wait_until="domcontentloaded",
-                        timeout=45000,
-                    )
-                    if detail_response is None or detail_response.status != 200:
-                        status = detail_response.status if detail_response else "no response"
-                        if status in (403, 429):
-                            if not wait_for_manual_verification(page, "#page-title h1"):
-                                print(f"[BLOCKED] Server returned {status} for {d_url}; stopping politely.")
-                                access_blocked = True
-                                break
-                        else:
-                            print(f"[SKIP] Detail page returned {status or 'no response'}: {d_url}")
+                        detail = fetch_text(
+                            page, detail_url,
+                            label=f"detail {year} p{page_num} #{index}",
+                        )
+                        if detail is None:
                             continue
 
-                    d_soup = BeautifulSoup(page.content(), 'html.parser')
-                    meta = extract_metadata(d_soup)
-                    meta["url"] = d_url
+                        soup = BeautifulSoup(detail["text"], "html.parser")
+                        meta = extract_metadata(soup)
+                        meta["url"] = detail_url
 
-                    page_heading = d_soup.select_one("#page-title")
-                    heading_text = (
-                        page_heading.get_text(" ", strip=True).upper()
-                        if page_heading
-                        else ""
-                    )
-                    if (
-                        "JAKARTA SELATAN" not in meta["lembaga"].upper()
-                        and "PN JAKARTA SELATAN" not in heading_text
-                    ):
-                        print(f"[SKIP] Not a PN Jakarta Selatan decision: {d_url}")
-                        continue
-                    if meta["tahun"] not in {"2023", "2024", "2025"}:
-                        print(f"[SKIP] Outside the 2023-2025 range: {meta.get('nomor', d_url)}")
-                        continue
+                        nomor = meta.get("nomor", "")
+                        if not nomor:
+                            print(f"[SKIP] Nomor putusan tidak ditemukan: {detail_url}")
+                            continue
+                        if meta["status_bht"]:
+                            print(f"[SKIP] Sudah BHT: {nomor}")
+                            continue
+                        if "JKT.SEL" not in nomor.upper() and "JAKARTA SELATAN" not in meta["lembaga"].upper():
+                            print(f"[SKIP] Bukan PN Jakarta Selatan: {nomor}")
+                            continue
+                        if nomor in existing_numbers:
+                            print(f"[SKIP] Sudah dimiliki: {nomor}")
+                            continue
 
-                    # Check exclusion constraint
-                    if meta["status_bht"]:
-                        print(f"[SKIP] BERKEKUATAN HUKUM TETAP: {meta.get('nomor', d_url)}")
-                        continue
+                        pdf_url = find_pdf_url(soup)
+                        if not pdf_url:
+                            print(f"[SKIP] Tidak ada lampiran PDF: {nomor}")
+                            sleep_polite()
+                            continue
 
-                    col3 = d_soup.find('div', id='collapseThree')
-                    if not col3:
-                        print(f"[SKIP] No attachment section: {meta.get('nomor', d_url)}")
-                        continue
+                        filename = f"{clean_filename(nomor)}.pdf"
+                        dest_file = os.path.join(DATASET_DIR, filename)
+                        if filename in existing_files or os.path.exists(dest_file):
+                            print(f"[SKIP] Berkas sudah ada: {filename}")
+                            existing_numbers.add(nomor)
+                            sleep_polite()
+                            continue
 
-                    pdf_button = page.locator('#collapseThree a[href*="/pdf/"]')
-                    if pdf_button.count() == 0:
-                        print(f"[SKIP] No downloadable PDF attachment: {meta.get('nomor', d_url)}")
-                        continue
+                        print(f"[GET ] {nomor} ...", flush=True)
+                        payload = fetch_pdf_bytes(page, pdf_url)
+                        if payload is None:
+                            print(f"[SKIP] Gagal mengunduh PDF: {nomor}")
+                            sleep_polite()
+                            continue
 
-                    nomor = meta['nomor'] or f"putusan_{new_downloaded+1}"
-                    clean_no = clean_filename(nomor)
-                    filename = f"{clean_no}.pdf"
-                    dest_file = os.path.join(DATASET_DIR, filename)
+                        temp_file = dest_file + ".part"
+                        with open(temp_file, "wb") as handle:
+                            handle.write(payload)
 
-                    if filename in existing_files:
-                        print(f"[EXISTS] Preserving existing PDF: {filename}")
-                        continue
-                    if os.path.exists(dest_file):
-                        print(f"[SKIP] Destination already exists and is not a verified PDF: {filename}")
-                        continue
+                        if not is_court_pdf(temp_file, nomor):
+                            os.remove(temp_file)
+                            print(f"[SKIP] Bukan PDF putusan yang valid: {nomor}")
+                            sleep_polite()
+                            continue
 
-                    temp_file = dest_file + ".part"
-                    try:
-                        with page.expect_download(timeout=10000) as download_info:
-                            pdf_button.first.click()
-                        download = download_info.value
-                        download.save_as(temp_file)
-                    except PlaywrightTimeoutError:
-                        print(f"[SKIP] Click did not start a PDF download: {nomor}")
-                        continue
+                        os.replace(temp_file, dest_file)
+                        total_saved += 1
+                        existing_files.add(filename)
+                        existing_numbers.add(nomor)
 
-                    if not is_court_pdf(temp_file, nomor):
-                        os.remove(temp_file)
-                        print(f"[SKIP] Download is not the expected court judgment PDF: {nomor}")
-                        continue
+                        meta["pdf_path"] = dest_file
+                        meta["pdf_filename"] = filename
+                        meta["pdf_size"] = len(payload)
 
-                    os.replace(temp_file, dest_file)
-                    new_downloaded += 1
-                    existing_files.add(filename)
-                    meta["pdf_path"] = dest_file
-                    meta["pdf_filename"] = filename
-                    meta["pdf_size"] = os.path.getsize(dest_file)
-                    existing_index = next(
-                        (i for i, item in enumerate(metadata_list) if item.get("url") == d_url),
-                        None,
-                    )
-                    if existing_index is None:
-                        metadata_list.append(meta)
-                    else:
-                        metadata_list[existing_index] = meta
-                    seen_urls.add(d_url)
-                    print(
-                        f"[SUCCESS] [{new_downloaded}/{TARGET_NEW} new] "
-                        f"Downloaded: {filename} ({meta['pdf_size']} bytes)"
-                    )
-
-                    with open(METADATA_FILE, "w", encoding="utf-8") as mf:
-                        json.dump(metadata_list, mf, ensure_ascii=False, indent=2)
-
-                except Exception as ex:
-                    if context.is_closed() or page.is_closed():
-                        print(
-                            "[STOPPED] Browser ditutup sebelum target tercapai; "
-                            f"PDF baru terverifikasi: {new_downloaded}/{TARGET_NEW}."
+                        record_index = next(
+                            (i for i, item in enumerate(metadata)
+                             if item.get("pdf_filename") == filename),
+                            None,
                         )
-                        access_blocked = True
-                        break
-                    print(f"[WARN] Error on decision {d_url}: {ex}")
-                    continue
-                finally:
-                    time.sleep(1.5)
+                        if record_index is None:
+                            metadata.append(meta)
+                        else:
+                            metadata[record_index] = meta
+                        save_metadata(metadata)
 
-            if access_blocked or new_downloaded >= TARGET_NEW:
-                break
+                        print(
+                            f"[OK  ] [{total_saved}/{TARGET_TOTAL}] {filename} "
+                            f"({len(payload)} bytes)",
+                            flush=True,
+                        )
+                        sleep_polite()
 
-        context.close()
+                    sleep_polite(1.5, 3.0)
+        finally:
+            context.close()
 
-    print(f"\n==================================================")
-    if new_downloaded < TARGET_NEW:
-        if access_blocked:
-            print("[INFO] Resume later after the source site permits access again.")
-        print(
-            f"[INCOMPLETE] Downloaded {new_downloaded}/{TARGET_NEW} new verified "
-            "original PDFs. No page printouts were substituted."
-        )
-        print(f"[INFO] Existing PDFs preserved: {len(existing_files) - new_downloaded}")
-        print(f"Files saved in: {DATASET_DIR}")
-        print("==================================================")
-        raise SystemExit(1)
+    print("\n" + "=" * 62)
+    if total_saved >= TARGET_TOTAL:
+        print(f"[DONE] {total_saved}/{TARGET_TOTAL} PDF putusan tersimpan di Dataset/.")
+    else:
+        print(f"[INCOMPLETE] {total_saved}/{TARGET_TOTAL} PDF tersimpan. "
+              "Jalankan ulang untuk melanjutkan.")
+    print("=" * 62)
+    if total_saved < TARGET_TOTAL:
+        sys.exit(1)
 
-    print(f"[DONE] Downloaded exactly {new_downloaded} new verified PDF files.")
-    print(f"[INFO] Total valid PDFs in Dataset: {len(existing_files)}")
-    print(f"Files saved in: {DATASET_DIR}")
-    print(f"==================================================")
 
 if __name__ == "__main__":
     main()
