@@ -19,11 +19,34 @@ dist/
 .ipynb_checkpoints/
 *.ipynb_checkpoints
 
+# Playwright / browser automation artifacts (profil & cache besar, jangan ikut versi)
+playwright_user_data/
+.playwright_profile/
+**/.playwright_profile/
+
+# Skrip eksperimen/debug di 'tugas 2' (yang dipakai hanya scraper.py, parser.py,
+# download_50_pdfs.py, dan batch_download_2023_2025.py)
+test_*.py
+inspect_*.py
+check_*.py
+find_*.py
+diagnose_*.py
+scan_*.py
+analyze_*.py
+search_links.py
+fast_scan_pdfs.py
+
+# Dump HTML / screenshot / PDF hasil debug scraping di root
+/*.html
+/*.png
+/*.pdf
+
 # Data mentah hasil unduhan (aset besar tidak ikut ter-versi)
 Dataset/*.pdf
 Dataset/*.zip
 data/raw/
 data/*.pdf
+data/metadata_raw.json
 
 # Logs & OS junk
 *.log
